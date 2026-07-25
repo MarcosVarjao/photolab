@@ -82,40 +82,6 @@ const unsharpMask = (data: Uint8ClampedArray, w: number, h: number, amount: numb
   }
 };
 
-// Bilateral-ish edge-preserving smoothing on a grayscale Float32Array.
-const edgeAwareBlur = (
-  gray: Float32Array,
-  w: number,
-  h: number,
-  spatial: number,
-  colorTol: number,
-): Float32Array => {
-  const out = new Float32Array(gray.length);
-  const r = spatial;
-  const tol2 = colorTol * colorTol;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      const c = gray[i];
-      let acc = 0;
-      let wsum = 0;
-      for (let dy = -r; dy <= r; dy++) {
-        const yy = Math.min(h - 1, Math.max(0, y + dy));
-        for (let dx = -r; dx <= r; dx++) {
-          const xx = Math.min(w - 1, Math.max(0, x + dx));
-          const j = yy * w + xx;
-          const diff = gray[j] - c;
-          const wgt = Math.exp(-(diff * diff) / tol2);
-          acc += gray[j] * wgt;
-          wsum += wgt;
-        }
-      }
-      out[i] = acc / wsum;
-    }
-  }
-  return out;
-};
-
 // Sobel edge magnitude (0-255), single channel.
 const sobelEdges = (gray: Float32Array, w: number, h: number): Float32Array => {
   const out = new Float32Array(gray.length);
@@ -141,16 +107,11 @@ const pencilTone = (gray: Float32Array, darkness: number, lineGain: number): Uin
   const out = new Uint8ClampedArray(gray.length);
   for (let i = 0; i < gray.length; i++) {
     const g = gray[i] / 255; // 0 dark .. 1 light
-    // Stroke intensity: more pencil where the image is darker.
-    // Use a gamma curve so shadows fill in with graphite.
-    let stroke = 1 - g; // 1 = full black pencil, 0 = no pencil
+    let stroke = 1 - g;
     stroke = Math.pow(stroke, darkness);
-    // Graphite gray ramp: full stroke -> ~45 (near black), no stroke -> ~225 (light gray)
-    // This keeps everything in the gray/black range, never pure white.
     const darkVal = 38;
     const lightVal = 225;
     let val = lightVal - (lightVal - darkVal) * stroke;
-    // Add a subtle pencil grain
     const grain = (Math.random() - 0.5) * 10;
     val = Math.max(20, Math.min(235, val + grain));
     out[i] = val;
@@ -167,12 +128,10 @@ const pencilWithEdges = (
   edgeStrength: number,
   blurRadius: number,
 ): Uint8ClampedArray => {
-  // Lightly blur to reduce per-pixel noise before edge detection
   const smooth = blurRadius > 0 ? gaussianBlur1C(gray, w, h, blurRadius) : gray;
   const edges = sobelEdges(smooth, w, h);
   const tone = pencilTone(gray, darkness, edgeStrength);
   for (let i = 0; i < tone.length; i++) {
-    // Darken where edges are strong (crisp pencil outlines)
     const e = Math.min(1, edges[i] / 180);
     const darkening = e * edgeStrength * 60;
     tone[i] = Math.max(15, tone[i] - darkening);
@@ -186,6 +145,24 @@ export interface ProcessOptions {
 
 // ---- Public API ----
 
+// Downscale an image data URL to a max dimension to keep inference memory-safe.
+const downscaleToBlob = async (src: string, maxDim: number): Promise<Blob> => {
+  const img = await loadImage(src);
+  let w = img.naturalWidth, h = img.naturalHeight;
+  const longest = Math.max(w, h);
+  if (longest <= maxDim) {
+    const resp = await fetch(src);
+    return await resp.blob();
+  }
+  const ratio = maxDim / longest;
+  w = Math.round(w * ratio);
+  h = Math.round(h * ratio);
+  const { canvas } = createCanvas(w, h);
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(img, 0, 0, w, h);
+  return await new Promise((resolve) => canvas.toBlob((b) => resolve(b!), 'image/png'));
+};
+
 export async function removeBackgroundFromImage(
   src: string,
   opts?: ProcessOptions,
@@ -193,13 +170,14 @@ export async function removeBackgroundFromImage(
   opts?.onProgress?.('Carregando modelo de IA…');
   const { removeBackground } = await import('@imgly/background-removal');
 
-  // Convert the data URL to a Blob so the library processes it locally
-  // without cross-origin fetch issues (important under COEP).
-  const response = await fetch(src);
-  const blob = await response.blob();
+  // Downscale to 1024px max to keep WASM memory usage safe.
+  // The library internally resizes to 1024x1024 for inference anyway.
+  opts?.onProgress?.('Preparando imagem…');
+  const blob = await downscaleToBlob(src, 1024);
 
   opts?.onProgress?.('Removendo o fundo…');
   const result = await removeBackground(blob, {
+    model: 'isnet_fp16',
     output: { format: 'image/png' },
     progress: (key: string, current: number, total: number) => {
       if (key === 'compute:inference') {
@@ -256,7 +234,6 @@ export async function wideAngleEffect(src: string, _opts?: ProcessOptions): Prom
   const maxR = Math.sqrt(cx * cx + cy * cy);
 
   // Subtle pincushion-to-barrel distortion typical of a quality 16-24mm lens.
-  // k1 negative = barrel, k2 positive corrects the edges (realistic lens profile).
   const k1 = -0.12;
   const k2 = 0.04;
   const norm = maxR > 0 ? 1 / maxR : 0;
@@ -283,18 +260,14 @@ export async function wideAngleEffect(src: string, _opts?: ProcessOptions): Prom
   }
 
   // HDR-style local tone mapping: lift shadows, recover highlights, keep midtones natural.
-  // We approximate exposure fusion by blending a gamma-lifted version with a highlight-compressed one.
   for (let i = 0; i < od.length; i += 4) {
     const r = od[i] / 255, g = od[i + 1] / 255, b = od[i + 2] / 255;
-    // Shadow lift (gamma 0.7 on dark areas)
     const lr = Math.pow(r, 0.72);
     const lg = Math.pow(g, 0.72);
     const lb = Math.pow(b, 0.72);
-    // Highlight compression (soft clip)
     const hr = 1 - Math.pow(1 - r, 1.6);
     const hg = 1 - Math.pow(1 - g, 1.6);
     const hb = 1 - Math.pow(1 - b, 1.6);
-    // Blend: shadows use lifted, highlights use compressed, midtones stay
     const tm = (v: number, lo: number, hi: number) => {
       if (v < 0.5) return lo * (0.5 - v) * 0.6 + v * (1 - (0.5 - v) * 0.6);
       return v * (1 - (v - 0.5) * 0.6) + hi * (v - 0.5) * 0.6;
@@ -303,7 +276,7 @@ export async function wideAngleEffect(src: string, _opts?: ProcessOptions): Prom
     let ng = tm(g, lg, hg);
     let nb = tm(b, lb, hb);
 
-    // Realistic color grading: slight warmth in highlights, cool in shadows (cinematic split)
+    // Realistic color grading: slight warmth in highlights, cool in shadows
     const luma = 0.299 * nr + 0.587 * ng + 0.114 * nb;
     if (luma > 0.55) {
       nr += 0.012;
@@ -312,7 +285,6 @@ export async function wideAngleEffect(src: string, _opts?: ProcessOptions): Prom
       nr -= 0.006;
       nb += 0.008;
     }
-    // Natural saturation (subtle, not punchy)
     const savg = 0.299 * nr + 0.587 * ng + 0.114 * nb;
     const sat = 1.12;
     nr = savg + (nr - savg) * sat;
@@ -324,7 +296,7 @@ export async function wideAngleEffect(src: string, _opts?: ProcessOptions): Prom
     od[i + 2] = Math.max(0, Math.min(255, nb * 255));
   }
 
-  // Gentle, realistic vignette (wide-angle lenses darken corners slightly)
+  // Gentle, realistic vignette
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const dx = x - cx, dy = y - cy;
@@ -370,11 +342,9 @@ export async function applySketch(src: string, style: SketchStyle, _opts?: Proce
 
   switch (style) {
     case 'classic':
-      // Medium darkness, clear tones, moderate edge emphasis
       sketch = pencilWithEdges(gray, w, h, 1.35, 1.0, Math.round(2 * scale));
       break;
     case 'rough': {
-      // Heavier graphite, bold edges, paper grain
       sketch = pencilWithEdges(gray, w, h, 1.6, 1.4, Math.round(2 * scale));
       for (let i = 0; i < sketch.length; i++) {
         const n = (Math.random() - 0.5) * 26;
@@ -383,21 +353,17 @@ export async function applySketch(src: string, style: SketchStyle, _opts?: Proce
       break;
     }
     case 'detailed':
-      // Finer, crisper lines — lighter darkness so detail survives, strong edges
       sketch = pencilWithEdges(gray, w, h, 1.15, 1.7, Math.round(1 * scale));
       break;
     case 'soft':
-      // Light pressure: lighter darkness, soft edges
       sketch = pencilWithEdges(gray, w, h, 0.9, 0.5, Math.round(4 * scale));
       break;
     case 'architectural': {
-      // Clean edge-only technical drawing: dark lines on light gray paper
       const smooth = gaussianBlur1C(gray, w, h, Math.round(1 * scale));
       const edges = sobelEdges(smooth, w, h);
       sketch = new Uint8ClampedArray(gray.length);
       for (let i = 0; i < edges.length; i++) {
         const e = edges[i];
-        // Light gray paper (210), dark graphite lines where edges are
         const lineDark = Math.min(255, e * 1.8);
         const v = 210 - lineDark * 0.82;
         sketch[i] = Math.max(25, Math.min(220, v));
